@@ -44,11 +44,11 @@ docker-composeからK8sへの移行を習得するために入門書を読んだ
     - [9-2: Kubernetes上のWasmを理解する](#9-2-kubernetes上のwasmを理解する)
     - [9-3: Kubernetes上のWasmを実際に使ってみる](#9-3-kubernetes上のwasmを実際に使ってみる)
   - [10: サービス検出の詳細](#10-サービス検出の詳細)
-    - [10-1: シーンを設定する](#10-1-シーンを設定する)
-    - [10-2: サービスレジストリ](#10-2-サービスレジストリ)
-    - [10-3: サービス検出](#10-3-サービス検出)
-    - [10-4: サービス検出とNamespace](#10-4-サービス検出とnamespace)
-    - [10-5: サービス検出のトラブルシューティング](#10-5-サービス検出のトラブルシューティング)
+    - [10.1: シーンを設定する](#101-シーンを設定する)
+    - [10.2: サービスレジストリ](#102-サービスレジストリ)
+    - [10.3: サービス検出](#103-サービス検出)
+    - [10.4: サービス検出とNamespace](#104-サービス検出とnamespace)
+    - [10.5: サービス検出のトラブルシューティング](#105-サービス検出のトラブルシューティング)
   - [11: Kubernetesストレージ](#11-kubernetesストレージ)
     - [11-1: 全体像](#11-1-全体像)
     - [11-2: ストレージプロバイダー](#11-2-ストレージプロバイダー)
@@ -57,7 +57,13 @@ docker-composeからK8sへの移行を習得するために入門書を読んだ
     - [11-5: ストレージクラスによる動的プロビジョニング](#11-5-ストレージクラスによる動的プロビジョニング)
     - [11-6: 実践編](#11-6-実践編)
   - [12: ConfigMapとSecret](#12-configmapとsecret)
+    - [12-1: 全体像](#12-1-全体像)
+    - [12-2: ConfigMap 理論](#12-2-configmap-理論)
+    - [12-3: ConfigMapの実践](#12-3-configmapの実践)
+    - [12-4: Secretを実際に体験](#12-4-secretを実際に体験)
   - [13: StatefulSet](#13-statefulset)
+    - [13-1: StatefulSet理論](#13-1-statefulset理論)
+    - [13-2: StatefulSetの実践](#13-2-statefulsetの実践)
   - [14: APIセキュリティとRBAC](#14-apiセキュリティとrbac)
   - [15: Kubernetes API](#15-kubernetes-api)
   - [16: Kubernetesの脅威モデル化](#16-kubernetesの脅威モデル化)
@@ -1393,39 +1399,839 @@ containerdを使用してKubernetesでWasmアプリをデプロイする手順�
 
 ## 10: サービス検出の詳細
 
-### 10-1: シーンを設定する
+### 10.1: シーンを設定する
 
-### 10-2: サービスレジストリ
+**--Pod間通信の概要--**
+Kubernetesクラスターに異なるアプリケーションA,Bをデプロイしている場合を考える。
+A-B間でリクエストを送信するのに必要なのは「他のアプリのService名」のみで、これさえ知っていればKubernetes側でいい感じにリクエストの送信を実施してくれる。
+本章では、Kubernetes側で行っているService名からPodへの通信の仕組みを見ていく。
 
-### 10-3: サービス検出
+概要としては
 
-### 10-4: サービス検出とNamespace
+1. 開発者がアプリケーション内に通信したい他アプリケーションのService名を設定する
+2. アプリケーションがKubernetesサービスレジストリに他アプリケーションのService名を渡してIPアドレスをリクエスト
+3. KubernetesサービスレジストリがIPアドレスを返却
+4. アプリケーションはIPアドレスによって他アプリケーションにリクエスト
 
-### 10-5: サービス検出のトラブルシューティング
+![serviceDetectOverview](../img/book-summary/KubernetesTextbook/10/serviceDetectOverview.png)
+
+### 10.2: サービスレジストリ
+
+**--サービスレジストリとは--**
+Kubernetesにおけるサービスレジストリとは、その名前の通り「Service名とそれに紐づくIPアドレスを保管しておくもの」。
+Kubernetesの用語としては「クラスターDNS」と呼ばれ、コントロールプレーン上で実行される。
+
+クラスターDNSの構成は
+
+| リソース | リソース名 | ネームスペース | 備考 |
+| - | - | - | - |
+| Deploy | coredns or kube-dns | kube-system | レプリカ数2 |
+| Service | kube-dns | kube-system | Podへのアクセス管理 |
+
+![clusterDNS](../img/book-summary/KubernetesTextbook/10/clusterDNS.png)
+
+10.1 で言っていた、「アプリケーションがKubernetesサービスレジストリにリクエスト」というのは、kube-dns Serviceにリクエストを送っているということである。
+
+**--サービス登録--**
+クラスターDNSの機能は「Service名からIPアドレスにマッピングできる」ことである。では、このセットはどのように登録されるのだろうか。
+結論は、「Serviceが生成されたら自動で登録される」だ。その流れは以下の通り
+
+1. YAMLによってServiceをデプロイ（Service名は開発者が命名済み）
+2. KubernetesがServiceにIPアドレス(ClusterIP)を割り振る+クラスタストアに保存
+3. クラスターDNSはServiceの生成を検知し、Service名とそれに紐づくIPアドレスを保存
+4. Serviceに伴うEndpointSliceが生成
+5. kube-proxyがServiceのIPに対するリクエストをPodへルーティングできるように待機
+
+※クラスターDNSがService名とそれに紐づくIPアドレスを保存する際、具体的には`DNS A レコード`と`SRV レコード`を登録している。
+
+**--コマンド--**
+クラスターDNSのリソース取得コマンドは以下。
+
+```sh
+# coredns Podの取得
+kubectl get pod -n kube-system -l k8s-app=kube-dns
+
+# coredns Deploymentの取得
+kubectl get deploy -n kube-system -l k8s-app=kube-dns
+
+# kube-dns Serviceの取得
+kubectl get svc -n kube-system -l k8s-app=kube-dns
+```
+
+### 10.3: サービス検出
+
+**--サービス検出の手法--**
+10.1 で述べたように、クラスター上のアプリケーションはService名をクラスターDNSに送信することで、他アプリケーションのIPアドレスを取得している。
+ここでの疑問は、すべてのアプリケーションはクラスターDNSにどのようにリクエストを送っているのか？ということである。
+
+その答えは「Kubernetesが自動で全てのコンテナに以下のような設定をすることで、クラスターDNSにリクエストを送信するようにになる」
+
+```conf
+; in container in pod
+; cat /etc/resolv.conf
+search ${namespace}.svc.cluster.local svc.cluster.local cluster.local
+nameserver ${クラスターDNSのIP}  ; kube-dns service のClusterIPに一致
+options ndots:5
+```
+
+**--ClusterIP ルーティング--**
+ここで言うClusterIPはkube-dnsのものだけでなくアプリケーションServiceのものも含まれる（多分）。
+
+ClusterIPはサービスネットワーク上にあり、ClusterIPへトラフィックを送るためのルーティングがない。
+そこで、コンテナがClusterIPにリクエストを送る際にはデフォルトゲートウェイに送信する。
+コンテナのデフォルトゲートウェイはコンテナの稼働しているNodeである。
+Nodeも自身のデフォルトゲートウェイに送信し、最終的にNodeのカーネルがトラフィックを処理する。
+
+↑これではPodまでトラフィックが行かないと思われるが、kube-proxyがClusterIPトラフィックを検知して適切なPodのIPにリダイレクトする。つまり、NodeのカーネルでClusterIPトラフィックを処理するたびにkube-proxyが横入してPod IPを返すようになっている。
+
+![clusterIPRouting](../img/book-summary/KubernetesTextbook/10/clusterIPRouting.png)
+
+### 10.4: サービス検出とNamespace
+
+**--Namespaceを考慮したサービス検出--**
+ここまでで他アプリケーションにリクエストを送るためにService名が必要であることを述べた。
+これは同一Namespceに属するアプリケーション同士の通信の話である。
+ではNamespaceを横断する通信はどのように実現されるのか。
+
+結論は「完全修飾ドメイン名(FQDN/Fully Qualified Domain Name)で指定する」。
+KubernetsにおけるServiceの完全修飾ドメイン名は以下の形式である。
+
+```sh
+${service_name}.${namespace}.svc.cluster.local
+```
+
+同一NamespaceではService名で指定していた部分を、異なるNamespaceでは上のような形式で指定する必要がある。
+
+![serviceDetectWithNamespace](../img/book-summary/KubernetesTextbook/10/serviceDetectWithNamespace.png)
+
+※`cluster.local`はクラスタードメインと呼ばれる
+
+### 10.5: サービス検出のトラブルシューティング
+
+**--調査対象リソース--**
+サービス検出においてトラブルが発生した際の調査対象リソースは以下。
+
+| リソース | リソース名 | ネームスペース | 備考 |
+| - | - | - | - |
+| Pod | coredns-... | kube-system | coredns Deploymentで管理される |
+| Service | kube-dns | kube-system | ClusterIP Service |
+| EndpointSlice | kube-dns-... | kube-system | |
+
+**--トラブルシューティング--**
+まずはPodを確認
+
+```sh
+# 実行中であることの確認
+kubectl get deploy -n kube-system -l k8s-app=kube-dns
+kubectl get pod -n kube-system -l k8s-app=kube-dns
+
+# ログの確認
+kubectl logs coredns-... -n kube-system
+```
+
+次にServiceとEndpointSliceを確認
+
+```sh
+# 稼働中であることとClusterIPがコンテナの/etc/resolve.confと一致していることを確認
+kubectl get svc kube-dns -n kube-system
+kubectl get endpointslice -n kube-sytem -l k8s-app=kube-dns
+```
+
+ここまで正常ならKubernetes Serviceの名前解決を行って機能しているか確認
+あるいはcoredns Podの再起動
+
+```sh
+# 再起動
+kubectl delete pod -n kube-system -l k8s-app=kube-dns
+```
 
 ---
 
 ## 11: Kubernetesストレージ
 
+本章ではKubernetesで（AWSやAzureなどの）外部ストレージを利用する方法を見る。
+基本的には外部側が、自身が提供するストレージをKubernetes上で利用するためのプラグインを提供しているので、そのプラグインを使用することで外部ストレージとKubernetesを接続することができるようになる。
+※外部ストレージは外部側に依存するので全てのKubernetesで共通の構成はここでは説明できない。GKEとLKEの例で説明する。
+
 ### 11-1: 全体像
+
+**--外部ストレージの例と用途--**
+ここで言う外部ストレージとは、クラウドとオンプレミスに限らず以下のようなものを内包している
+
+- ブロックストレージ（AWS EBSなど）
+- ファイルストレージ（AWS EFSなど）
+- オブジェクトストレージ（AWS S3など）
+
+外部ストレージの用途は例えば、クラスター上で永続ボリュームを使用したいアプリケーション（DBなど）を運用する際にボリュームを外部に置くことで、Nodeのメモリ圧迫を防いだりできる。
+
+**--構成概要--**
+Kubernetesで外部ストレージを使用する際は以下のような構成になる。
+
+![storageArchitecture](../img/book-summary/KubernetesTextbook/11/storageArchitecture.png)
+
+各用語は
+
+- CSI(Container Storage Interface)
+    外部ストレージとKubernetesのインターフェース。
+- SC(StorageClasses)
+    外部ストレージのクラス（どのような設定のストレージか）を定義し、CSIとやり取りする。
+- PV(PersistentVolumes)
+    外部ストレージのマッピング。Podにマウントする実質的なKubernetes上のボリューム。
+- PVC(PersistentVolumeClaims)
+    PodがPVにアクセスする時に許可を出すもの。
+
+**--永続ボリューム構築フロー--**
+上記の構成を構築する際、そのほとんどは自動化されている。自動的な手続きを含め以下のような流れで構築される。
+Kubernetes上にCSIプラグインをインストールし、SCがデプロイされている状況から始める。
+
+1. 外部ストレージを必要とするPodと関連するPVCをデプロイ。
+2. PodはPVCを参照しており、PVCは指定したSCに対してPVの作成を要求。
+3. SCはCSIプラグインを介して外部ストレージ作成を要求
+4. CSIプラグインは外部ストレージ（AWS EBSなど）を作成し、SCに報告
+5. SCはPVを作成し、外部ストレージをPVにマッピング
+6. PodはPVをマウントし、ボリュームとして使用
+
+※正確にはSCは定義が書かれたドキュメントで、永続ボリュームサブシステムや外部との処理をするのはcsi-controller（CSIプラグインの一部）。CSIプラグインはCSI Driverと言ったりする。
+
+![buildFlow](../img/book-summary/KubernetesTextbook/11/buildFlow.png)
 
 ### 11-2: ストレージプロバイダー
 
+ストレージプロバイダー（ストレージプロビジョナー）とは、外部システムのストレージの総称である。
+各プロバイダーごとに独自のCSIプラグイン（ebs-csiのような粒度）が公開されており、自身のKubernetesにインストールすると `kube-system` Namespace上にCSIプラグインPodが生成される。
+
+![image](../img/book-summary/KubernetesTextbook/11/csiPlugin.png)
+
 ### 11-3: コンテナストレージインターフェース(CSI)
+
+11.2節と同じ。CSIプラグインはCSI Driverとも呼ばれる。
+
+例としてebs-csi Podやefs-csi PodなどがKubernetesで稼働する。
+恐らくNodeに1つずつ存在する。
 
 ### 11-4: Kubernetes永続ボリュームサブシステム
 
+**永続ボリュームサブシステムとは、アプリケーションがストレージを要求・アクセスできるようにするAPIオブジェクトセット**であり、主にPV,PVC,SCで構成される。
+
+※Kubernetesの仕組みで、複数のPodが同じPVに書き込むのは禁止される。そのためDBを冗長化する際、書き込み（CRUDの内CUD）操作ができるのは1つのPodだけ。
+
+**--PVC--**
+PersistentVolumeClaimsの略で、PodからPVへのアクセス許可をするもの
+
+![pvc](../img/book-summary/KubernetesTextbook/11/pvc.png)
+
+**--PV--**
+PersistentVolumesの略で、Kubernetes上で外部ストレージをボリュームとして使用できるようにするもの。外部ストレージがマッピングされる。このマッピングは1対1。
+pvはNamespace管理ではない。外部ストレージがClusterとは切り離されていることからも明らか。
+
+![pv](../img/book-summary/KubernetesTextbook/11/pv.png)
+
+※ボリュームのメモリはNodeのメモリを消費せず、外部ストレージのメモリを消費する。Podに割り振られているメモリはDBのキャッシュなどに使用されている。
+
+**--SC--**
+StorageClassesの略で、外部ストレージインスタンスとPVを動的に作成するためのもの。
+外部ストレージの種類によって異なるSCを定義する必要がある。
+
 ### 11-5: ストレージクラスによる動的プロビジョニング
 
+**--ストレージクラス--**
+ストレージクラスのマニフェストファイルは
+
+```yaml
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+    name: ${sc_name}
+provisioner: ${csi_plugin}
+parameters:
+    # 使用する外部ストレージごとに専用のパラメータを設定する
+allowedTopologies:  # ボリュームとレプリカを配置する場所
+...
+```
+
+その他、ストレージクラスについて特記事項は
+
+- 一度デプロイすると変更できない
+- Namespace管理ではない
+- parameterはプラグイン固有のためドキュメントを参照すべき
+- 「プロビジョナー」「プラグイン」「ドライバー」は同じ意味で使用されることがある
+
+**--動的プロビジョニング--**
+SCを使用して外部ストレージとPVのセッティングを自動化（動的プロビジョニング）する際は以下の3つを行えばよい。
+
+1. CSIプラグインをClusterにインストール・設定
+2. SCをデプロイ
+3. 「SC経由でボリュームを要求するPVC」を持つPodをデプロイ
+
+※手順1について、EKSなどのクラウドKubernetesサービスでは、同クラウドの外部ストレージ用（EBSなど）のCSIプラグインがプリインストールされているため、簡単に使用できる。
+
+上記手順の2,3を満たすマニフェストファイルは以下
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+    name: ${pod_name}
+spec:
+    volumes:
+        - neme: ${volume_name}
+            # 参照するPVCの設定
+            persistentVolumeClaim:
+                claimName: ${pvc_name}
+...
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+    name: ${pvc_name}   # Podで指定したclaimNameに一致させる
+spec:
+...
+# PodからPVへのアクセスのモードを設定
+accessModes:
+- ReadWriteOnce
+    resources:
+    requests:
+    storage: ${storage_memory}
+    # 参照するSCの名前
+    storageClassName: ${sc_name}
+---
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+    name: ${sc_name}    # Pvcで指定したstorageClassNameに一致させる
+provisioner: ${csi_plugin}
+parameters:
+...
+# ストレージの処理方法
+reclaimPolicy: ${delete_or_retain}
+```
+
+**--accessMode--**
+accessModeはPVCに設定し、PodからPVへのアクセスを取り決めるもので、以下の3種類が設定可能
+
+- ReadWriteOnce(RWO)
+    PVC１つだけを読み取り/書き込み(R/W)モードでボリュームにバインドできる
+- ReadWriteMany(RWM)
+    複数のPVCを読み取り/書き込み(R/W)モードでボリュームにバインドできる
+- ReadOnlyMany(ROM)
+    複数のPVCを読み取り専用(R/O)モードでボリュームにバインドできる
+
+※PV側は1つのモードでしか開くことができないので、PVCのaccessModeは混在させない方が良い
+
+**--reclaimPolicy--**
+reclaimPolicyはPVCが解放（削除？）された際に、関連するPVと外部ストレージを削除するかどうかを設定する。
+`Delete`で一緒に削除、`Retain`で保持。
+
 ### 11-6: 実践編
+
+**--volumeBindingModeオプション--**
+SCに設定するvolumeBindingModeオプションはボリュームの作成タイミングをコントロールできる。
+`Immediate`では、Podのデプロイを待たずにPVCが作成されたタイミングで外部ストレージとPVを作成する設定。
+`WaitForFirstConsumer`では、Podのデプロイ後に外部ストレージとPVを作成する設定。
+
+`WaitForFirstConsumer`でPodデプロイ前の状態ではPVCがPending状態になる。
+
+**--コマンド--**
+sc,pvc,pv関連のコマンドは
+
+```sh
+# sc取得
+kubectl get sc
+
+# sc詳細取得
+kubectl describe sc ${sc_name}
+
+# pvc取得
+kubectl get pvc -n ${namespace}
+
+# pvc削除
+kubectl delete pvc -n ${namespace} ${pvc_name}
+
+# pv取得
+kubectl get pv
+```
 
 ---
 
 ## 12: ConfigMapとSecret
 
+### 12-1: 全体像
+
+**--config分離の必要性と利点--**
+アプリケーションは、アプリケーションバイナリ（多分ソースコードロジック部分）と、config（ネットワーク・認証・セキュリティの設定などアーキテクチャー寄りの部分？）で構成されている。
+
+この2部構成のアプリケーションをイメージ化してしまうと、環境ごとに異なるイメージが必要となってしまう。
+しかし理想は、configは環境ごとに用意し、アプリケーションバイナリを共通イメージとして使用することである。こうすることで以下の利点が得られる。
+
+- テスト回数の削減
+- イメージ数の削減
+- アプリケーションバイナリに機密データが含まれないことによる公開安全性
+
+Kubernetes ConfigMapは、この分離を実現するのに必要なリソースである。
+
+### 12-2: ConfigMap 理論
+
+**--ConfigMapとは--**
+**ConfigMap(cm)とは、Podの外部に（機密性の無い）configデータを保存しておきPod実行時に挿入するためのリソース**である。
+ここで言う機密性のないデータとは
+
+- 環境変数
+- webサーバー構成・DB構成などの構成ファイル
+- ホスト名
+- サービス名とサービスポート番号
+- アカウント名
+
+などである。
+※証明書やパスワードなどの機密データの格納にはSecretを使用するべき。
+
+**--ConfigMapマニフェスト--**
+ConfigMapに格納するデータは複数のキーと値を持つオブジェクトである。
+マニフェストファイルの`data`プロパティ配下に以下のように記述する。
+
+```yaml
+# 値が文字列・数値の場合
+kind: ConfigMap
+apiVersion: v1
+metadata:
+    name: ${configmap_name}
+data:
+    ${key1}: ${value1}
+    ${key2}: ${value2}
+    ...
+
+# 値がファイルの場合
+kind: ConfigMap
+apiVersion: v1
+metadata:
+    name: ${configmap_name}
+data:
+    ${file_name}: |
+        ${file_src_line1}
+        ${file_src_line2}
+        ...
+```
+
+※spec,statusがないのは、目的の状態と現在の状態の概念がなく自動復旧などの機能を備える必要がないから。
+
+**--Podへの挿入手法--**
+Podへのデータの挿入手法は以下の3つ
+
+- 環境変数
+- コンテナ起動コマンドのオプション
+- ボリューム内のファイル
+
+※ボリューム内のファイルとして挿入した場合のみ、ConfigMapのデータの変更を検知してボリューム内のファイルも自動更新される。
+
+### 12-3: ConfigMapの実践
+
+**--kubectlコマンド--**
+kubectlコマンドにおいて、リソース名`configmap`は`cm`に省略可能である。
+ConfigMapの作成コマンドは
+
+```sh
+# コマンドから生成（値が文字列・数値の場合）
+kubectl create cm ${configmap_name} --from-literal ${key1}=${value1} --from-literal ${key2}=${value2} ...
+# コマンドから生成（値がファイルの場合）
+kubectl create cm ${configmap_name} --from-file ${file_path}
+
+# マニフェストファイルからの宣言的な作成
+kubectl apply -f ${file_name}
+```
+
+ConfigMapの取得コマンドは
+
+```sh
+# 取得
+kubectl get cm -n ${namespace}
+
+# 詳細取得
+kubectl describe cm ${configmap_name} -n ${namespace}
+```
+
+**--Podへの挿入方法（環境変数）--**
+Podのマニフェストファイルにおける`containers/env`にconfigMap由来の環境変数を指定する。
+
+```yaml
+apiVersion: v1
+kind: Pod
+...
+spec:
+  containers:
+    - name: ${container_name}
+      env:
+        - name: ${environment_name1}
+          valueFrom:
+            configMapKeyRef:
+              name: ${configmap_name}
+              key: ${key1}
+        - name: ${environment_name2}
+          valueFrom:
+            configMapKeyRef:
+              name: ${configmap_name}
+              key: ${key2}
+...
+```
+
+Podがデプロイされ、該当のコンテナが起動する際にこれらの環境変数が注入される。
+Podのコンテナ環境変数を確認したければ
+
+```sh
+kubectl exec ${pod_name} -n ${namespace} -- env
+kubectl describe pod ${pod_name} -n ${namespace}
+```
+
+**--Podへの挿入方法（コンテナ起動コマンドオプション）--**
+環境変数として挿入した際と同様にPodのマニフェストファイルにおける`ocntainers/env`に環境変数を指定する。異なるのは、起動コマンドでその環境変数を指定することである。
+
+```yaml
+...
+spec:
+  containers:
+    - name: ${container_name}
+      image: ${image}
+      env:
+        - name: ${environment_name1}
+          valueFrom:
+            configMapKeyRef:
+              name: ${configmap_name}
+              key: ${key1}
+        - name: ${environment_name2}
+          valueFrom:
+            configMapKeyRef:
+              name: ${configmap_name}
+              key: ${key2}
+      command: [ "/bin/sh", "-c", "echo $(${environment_name1}), $(${environment_name2})"]
+...
+```
+
+**--Podへの挿入方法（ボリューム）--**
+ボリューム経由でPodのコンテナにConfigMapデータを挿入するには、**PodのマニフェストでConfigMapボリュームを定義し、そのボリュームをコンテナにマウント**すれば良い。
+ConfigMapの各エントリ（設定値の塊）はコンテナ内ファイルとして挿入・同期される。
+
+![volume](../img/book-summary/KubernetesTextbook/12/volume.png)
+
+Podのマニフェストは以下のような記述になる
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod_name}
+spec:
+  volumes:
+    - name: ${volume_name}
+      configMap:
+        name: ${configmap_name}
+  container:
+    - name: ${container_name}
+      image: ${image}
+      volumeMounts:
+        - name: ${volume_name}
+          mountPath: ${container_directory_path}
+...
+```
+
+Pod内にファイルが配置されたかの確認は
+
+```sh
+kubectl exec ${pod_name} -n ${pod_name} -- ls ${container_directory_path}
+kubectl exec ${pod_name} -n ${pod_name} -- cat ${container_file_path}
+```
+
+### 12-4: Secretを実際に体験
+
+**--Secretとは--**
+**Secretとは、機密データを保存しておく用のConfigMap。リソースとして区別しているだけ。**
+機密データは例えば
+
+- パスワード
+- 証明書
+- トークン
+
+PodにSecretデータが挿入されるフローは
+
+1. Secretが作成されると、Kubernetesは暗号化されていないオブジェクトとしてクラスタストアに保存
+2. Podをスケジュール
+3. Kubernetesは、暗号化されていないSecretをネットワーク経由でPod実行Nodeに転送
+4. Node上のkubeletはPodとコンテナを起動
+5. コンテナランタイムは、メモリ内のtmpfsファイルシステムを介してSecretをコンテナにマウントし、base64からプレーンテキストにデコード
+6. アプリケーションがSecretを使用
+7. Podの削除に伴い、Node上のSecretコピーが削除される（クラスタストアには保存されている）
+
+**--Kubernetes Secretの改善点--**
+KubernetesClusterを新規構築した場合、使用できるSecretはあまり安全ではない。改善点は
+
+- クラスタストアに保存ｓㇾているSecretの暗号化
+- ネットワーク上で転送中のSecretの暗号化
+- Node,Pod,コンテナに表示されたSecretの保護
+- 最小権限RBACによるSecretへのAPIアクセス制御
+- etcdノード（クラスタストア）へのアクセス制御
+- 特権コンテナによるSecretへのアクセス防止
+- ソースコードリポジトリを介した情報漏洩防止
+- 不要なSecretの安全な削除
+
+※EncreptionConfiguration,Vault,サービスメッシュで検索！！
+
+**--コマンド--**
+作成はConfigMapと同様に行う。コマンドで作成する場合
+
+```sh
+kubectl create secret generic ${secret_name} --from-literal ${key}=${value} 
+```
+
+マニフェストファイルから宣言的に作成する場合は
+
+```sh
+kubectl apply -f ${file_path}
+```
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${secret_name}
+type: Opaque
+# エンコードされたデータの場合
+data:
+  ${key1}: ${encoded_value1}
+  ${key2}: ${encoded_value2}
+# プレーンテキストデータの場合
+stringData:
+  ${key1}: ${value1}
+  ${key2}: ${value2}
+```
+
+Secretデータの確認は、`get -o yaml`で行うがBase64エンコードされているのでデコードが必要（base64ユーティリティのインストールが必要）
+
+```sh
+kubectl get secret ${secret_name} -n ${namespace} -o yaml
+echo ${decoded_value} | base64 -d
+```
+
+**--PodでのSecret使用--**
+ConfigMapと同様に環境変数・コンテナ起動コマンド・ボリュームの3種類の手法でSecretデータを挿入できる。
+ただしマニフェストファイルが少し変わるだけ。
+
+ボリュームで使用する場合のマニフェストは例えば
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod_name}
+spec:
+  volumes:
+  - name: ${volume_name}
+    secret:
+      secretName: ${secret_name}
+  containers:
+  - name: ${container_name}
+    image: ${image}
+    volumeMounts:
+    - name: ${volume_name}
+      mountPath: ${container_directory_path}
+...
+```
+
 ---
 
 ## 13: StatefulSet
+
+### 13-1: StatefulSet理論
+
+**--StatefulSetとは--**
+**StatefulSetとは、Kubernetes上でステートフルアプリケーションを管理するためのリソースであり、Podに自己修復・スケーリング・ロールアウトの機能を追加する。**Deploymentのちょっと違うバージョン。
+ステートフルアプリケーションとは、データベース・キーバリューストアなどの、貴重なデータを作成・保存するアプリケーションのことである。
+
+StatefulSetはDeploymentに以下の機能を追加したものと考えると覚えやすい。
+
+- 予測可能で永続的なPod名とDNS名の付与
+- 予測可能で永続的なボリュームバインディング
+- 予測可能な起動およびシャットダウン順序
+
+StatefulSetのマニフェストの例は
+
+```yaml
+apiVersion: apps.v1
+kind: StatefulSet
+metadata:
+  name: ${statefulset_name}
+spec:
+  selector:
+    matchLabels:
+      ${labels}
+  serviceName: ${headless_service_name}
+  replicas: ${replica_number}
+  template:
+    metadata:
+      labels:
+        ${labels}
+    spec:
+      containers:
+      - name: ${pod_container_name}
+        image: ${image}
+        ...
+```
+
+**--StatefulSet Podの命名（予測可能で永続的なPod名とDNS名の付与）--**
+**StatefulSet Pod名は `${statefulset_name}-${index_from_0}` で表される。**
+
+**--Podの作成と削除（予測可能な起動およびシャットダウン順序）--**
+StatefulSet Podが作成・削除される際、付与されている番号順に実行される。
+具体的には以下のようなフローである。
+
+- Pod作成フロー
+  - 番号の最も若いPodが作成される
+  - 作成したPodが正常な実行状態になるまで待機
+  - 次に番号の若いPodが作成される
+  - ...
+- Pod削除フロー
+  - 番号の最も大きいPodが削除される
+  - 削除Podが完全に終了するまで待機
+  - 次に番号の大きいPodが削除される
+  - ...
+
+**--StatefulSetの削除--**
+以下の2点に注意が必要
+
+- StatefulSetを削除してもPodは削除されないので、先にレプリカ数を0にしておく必要がある
+- `terminationGracePeriodSeconds`を最低10秒以上に指定してデータへの書き込みをコミットする時間を確保しておく必要がある
+
+**--ボリューム（予測可能で永続的なボリュームバインディング）--**
+StatefulSet Podが作成されると、各Podにリンクするボリューム(PV)も自動で作成される。ここで付与されるボリューム名は `${templateで記載したvolume名}-${corresponding_pod_name}` のように完全に予測可能な名前である。
+これらのボリュームはPodの障害や削除では削除されず、存続する。この利点として、代替となる新しいPod（削除されたPodと同名のPodが作成される）が作成されたときに、存続しているボリュームに自動でアタッチされる。
+
+![image](../img/book-summary/KubernetesTextbook/13/image.png)
+
+**--Headless service--**
+**Headless Serviceとは、ClusterIPアドレスを持たないServiceオブジェクトのこと。**
+Headless ServiceはStatefulSetで使用され、各Podに予測可能なDNS名を付与し、Podへのトラフィックの負荷分散を行わないようなServiceである。
+具体的には、ラベルセレクターに一致する全Podに対してDNSレコードを作成し、他アプリケーションから直接Podへアクセスできるようにする。
+
+※通常のService経由のPodは個別のDNSレコードが生成されずPodにFQDNは存在しない。ServiceのFQDNは`${service_name}.${namespace}.svc.cluster.local`である。
+一方でHeadlessService経由のPodは個別にDNSレコードが生成され、PodのFQDNは`${pod_name}.${service_name}.${namespace}.svc.cluster.local`となる。
+
+StatefulSetでHeadless Serviceを使用するためのマニフェストの例は
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${service_name}
+spec:
+  clusterIP: None
+  selector:
+    ${label}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ${statefulset_name}
+spec:
+  serviceName: ${service_name}
+```
+
+### 13-2: StatefulSetの実践
+
+**--デプロイ方法--**
+まずはStorageClassをデプロイ
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ${storageclass_name}
+provisioner: ${csipluguin}
+allVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+```
+
+次にHeadlessServiceをデプロイ
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${service_name}
+spec:
+  ports:
+  - port: 80
+    name: ${name}
+  clusterIP: None
+  selector:
+    ${label}
+```
+
+次にStatefulSetをデプロイ
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ${statefulset_name}
+spec:
+  replicas: ${replica_number}
+  # statefulsetがどのpodを管理するか指定
+  selector:
+    matchLabels:
+      ${label}
+  serviceName: ${service_name}
+  # podテンプレート
+  template:
+    metadata:
+      labels:
+        ${label}
+    spec:
+      terminationGracePeriodSeconds: ${seconds}
+      containers:
+      - name: ${container_name}
+        image: ${image}
+        ports:
+          - containerPort: 80
+            name: ${name}
+        volumeMounts:
+        - name: ${volume_Name}
+          mountPath: ${container_directory_path}
+  # Pod固有のPVCを作成するための設定
+  volumeClaimTemplates:
+    metadata:
+      name: ${volume_name}
+    spec:
+      accessModes: [ "${access_mode}" ]
+      storageClassName: ${storageclass_name}
+      resources:
+        requests:
+          storage: ${Bytes}
+```
+
+これによって作成されるKubernetesリソースの名前は
+
+| resource | name | index |
+| - | - | - |
+| sc | ${storageclass_name} | none |
+| svc | ${service_name} | none |
+| sts | ${statefulset_name} | none |
+| pod | ${statefulset_name}-${index} | 0,1,,... |
+| pvc | ${volume_name}-${statefulset_name}-${index} | 0,1,,... |
+| pv | pvc-${random} | none |
+
+**--スケーリング--**
+上記のようなStatefulsetPodのレプリカ数を増やした場合（スケールアップ）、新しいPod・PVC・PVが作成される。
+一方でレプリカ数を減らした場合（スケールダウン）、indexの大きい順にPodのみ削除される。再度スケールアップするとPodのみ作成され、残存しているPVCに自動で接続される。
+
+※残存して接続されていないPVCを`kubectl get`しても、STATUSカラムは`Bound`表記のままであることに注意。Podに接続しているかどうかを判断するには
+
+```sh
+kubectl describe pvc ${pvc_name} -n ${namespace} | grep Used
+```
+
+でPod名が指定されているかどうかを確かめる必要がある。
+
+スケーリング（のみ）において、StatefulSetPodの起動・停止方法を設定できる`spec.podManagementPolicy`プロパティが存在する。
+
+- OrderdReady：前のPodの操作が完了してから1つずつPodを起動・停止する。デフォルト設定。
+- Parallel：同時に複数のPodを起動・停止する。
 
 ---
 
@@ -1498,3 +2304,12 @@ a
 
 **--W3C--**
 あ
+
+**--DNS A レコード--**
+一般的なDNSレコード。ドメインとIPアドレスを登録。
+
+**--SRV レコード--**
+サービスレコード。サービス名・ホスト名・ポート番号などを登録。
+
+**--デフォルトゲートウェイ--**
+ネットワークトラフィックの送信先がわからない場合にデフォルトで送信する場所。「自分じゃどこに送ればいいかわからないから上司に代わりに送ってもらおう」的な。
